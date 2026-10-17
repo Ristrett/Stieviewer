@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="color-scheme" content="dark">
+<title>SiteSee Mobile Viewer</title>
+<!--
+  SiteSee Mobile Viewer (Ein) - a one-file 3D viewer for a SiteSee job, built for phones.
+
+  Data: the same files the official viewer reads from Azure Blob storage, through the job's
+  read-only SAS token (valid ~4 h):  <base>scene.json  <base>3dtiles/3dtiles.json  (3D Tiles, b3dm)
+  <base>annotations/equipment/<name>.json.  Open as  viewer.html#job=job-18078&base=<url>&sas=<token>
+  (the bookmarklet on app.sitesee.com.au builds that link) or paste a link in the start screen.
+
+  Conventions (checked against the official viewer, 2026-10-17): positions are ECEF metres, a box is
+  BoxGeometry(width, height, depth) with the front on local -z; a dish is a cylinder whose axis (+y)
+  is the facing direction; rotation = Euler XYZ radians.
+-->
+<script type="importmap">
+{"imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/": "https://cdn.jsdelivr.net/npm/three@0.160.0/",
+  "3d-tiles-renderer": "https://cdn.jsdelivr.net/npm/3d-tiles-renderer@0.3.41/src/index.js"
+}}
+</script>
+<style>
+  /* layout: full-screen canvas, a compact top bar, a floating control stack on the right, a
+     bottom sheet for the equipment list and details - everything reachable with a thumb */
+  :root {
+    --bg: #14181d; --panel: rgba(22, 27, 33, .92); --line: #2e3742; --fg: #e6ebf0; --muted: #9aa6b4;
+    --accent: #ffa000; --box: #ffa000; --panelc: #22d3ee; --dish: #ff4081; --yagi: #b2ff59; --dipole: #e040fb; --omni: #ff5252; --origin: #00ff88;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans Thai", sans-serif;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 var(--font); overflow: hidden; overscroll-behavior: none; }
+  #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  button, select, input { font: inherit; }
+  .btn { background: var(--panel); color: var(--fg); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; cursor: pointer; min-height: 40px; }
+  .btn:active { background: #2a3340; }
+  .btn.on { border-color: var(--accent); color: var(--accent); }
+  #top { position: fixed; top: env(safe-area-inset-top, 0px); left: 0; right: 0; display: flex; gap: 6px; align-items: center; padding: 8px 10px; pointer-events: none; z-index: 5; }
+  #top > * { pointer-events: auto; }
+  #job { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; font-weight: 600; letter-spacing: .02em; }
+  #status { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; color: var(--muted); font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 auto; }
+  #layers { position: fixed; top: calc(env(safe-area-inset-top, 0px) + 56px); left: 10px; display: flex; flex-direction: column; gap: 6px; z-index: 5; }
+  #layers .chip { display: flex; align-items: center; gap: 6px; background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px; font-size: 12px; cursor: pointer; user-select: none; }
+  #layers .chip i { width: 10px; height: 10px; border-radius: 50%; background: var(--c, #fff); display: inline-block; }
+  #layers .chip.off { opacity: .45; }
+  #right { position: fixed; right: 10px; top: 50%; transform: translateY(-50%); display: flex; flex-direction: column; gap: 8px; z-index: 5; }
+  #right .btn { width: 44px; height: 44px; padding: 0; font-size: 18px; display: grid; place-items: center; }
+  #sheet { position: fixed; left: 0; right: 0; bottom: 0; background: var(--panel); border-top: 1px solid var(--line); border-radius: 16px 16px 0 0; padding: 8px 14px calc(12px + env(safe-area-inset-bottom, 0px)); z-index: 6; max-height: 46vh; display: flex; flex-direction: column; gap: 8px; transition: transform .2s; }
+  #sheet.min { transform: translateY(calc(100% - 44px)); }
+  #sheet .grip { align-self: center; width: 40px; height: 4px; border-radius: 2px; background: var(--line); }
+  #sheet header { display: flex; align-items: center; gap: 8px; }
+  #sheet header b { flex: 1; }
+  #list { overflow: auto; display: flex; flex-wrap: wrap; gap: 6px; min-height: 0; }
+  #list .it { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; cursor: pointer; font-size: 13px; display: flex; gap: 6px; align-items: center; background: transparent; color: var(--fg); }
+  #list .it i { width: 8px; height: 8px; border-radius: 50%; background: var(--c); }
+  #info { font-size: 13px; color: var(--muted); display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+  #info b { color: var(--fg); }
+  #start { position: fixed; inset: 0; background: var(--bg); display: flex; align-items: center; justify-content: center; padding: 24px; z-index: 10; }
+  #start form { width: min(520px, 100%); display: flex; flex-direction: column; gap: 12px; }
+  #start h1 { font-size: 22px; margin: 0; }
+  #start p { color: var(--muted); margin: 0; }
+  #start input { background: #0f1317; color: var(--fg); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; width: 100%; box-sizing: border-box; }
+  #start .recent { display: flex; flex-wrap: wrap; gap: 6px; }
+  #err { color: #ff6b6b; white-space: pre-wrap; }
+  #howto { margin: 0; padding-left: 20px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+  #howto b, #howto code { color: var(--fg); }
+  #bmk { color: var(--muted); font-size: 13px; }
+  #bmk summary { cursor: pointer; color: var(--accent); }
+  #bmk textarea { width: 100%; box-sizing: border-box; background: #0f1317; color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 8px; font: 11px/1.4 ui-monospace, monospace; }
+  #load { position: fixed; left: 50%; bottom: calc(60px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%); background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; font-size: 12px; color: var(--muted); z-index: 5; pointer-events: none; }
+  [hidden] { display: none !important; }
+  @media (max-width: 480px) { #layers .chip span { display: none; } #layers .chip { padding: 8px; } }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="top"><div id="job">SiteSee</div><div id="status">กำลังเริ่ม…</div><button class="btn" id="btnMenu" title="เปลี่ยนงาน">☰</button></div>
+<div id="layers"></div>
+<div id="right">
+  <button class="btn" id="btnFit" title="มองทั้งไซต์">⛶</button>
+  <button class="btn" id="btnEquip" title="มองอุปกรณ์">▣</button>
+  <button class="btn" id="btnOrigin" title="ไปที่ origin">⌖</button>
+  <button class="btn" id="btnTop" title="มองจากบน">⬇</button>
+  <button class="btn" id="btnIn" title="ซูมเข้า">＋</button>
+  <button class="btn" id="btnOut" title="ซูมออก">－</button>
+</div>
+<div id="load" hidden></div>
+<div id="sheet" class="min">
+  <div class="grip" id="grip"></div>
+  <header><b id="sheetTitle">อุปกรณ์</b><span id="count" style="color:var(--muted);font-size:12px"></span><button class="btn" id="btnSheet" style="min-height:32px;padding:4px 10px">▲</button></header>
+  <div id="info" hidden></div>
+  <div id="list"></div>
+</div>
+<div id="start">
+  <form id="startForm">
+    <h1>SiteSee Mobile Viewer</h1>
+    <p>หน้านี้ไม่มีระบบ login ของ SiteSee จึงเปิดจาก URL ของ app.sitesee.com.au ตรงๆ ไม่ได้ — ต้องใช้ <b>ลิงก์ข้อมูล</b> (มี token อายุ ~4 ชม.) ที่ bookmarklet สร้างให้จากหน้า job ที่ login แล้ว</p>
+    <ol id="howto">
+      <li>เปิด <code>app.sitesee.com.au/site-viewer/&lt;job&gt;</code> ใน Chrome (login Microsoft ตามปกติ) รอโมเดลขึ้น</li>
+      <li>กด bookmark <b>Ein viewer</b> (บนมือถือ: พิมพ์ชื่อ bookmark ในช่องที่อยู่แล้วแตะ) → หน้านี้จะเปิดพร้อมงานนั้น</li>
+      <li>หรือวางลิงก์ที่ bookmarklet ให้ (ขึ้นต้นด้วย …viewer.html#job=) ในช่องด้านล่าง</li>
+    </ol>
+    <input id="linkIn" placeholder="…viewer.html#job=job-18078&base=…&sas=…" autocomplete="off">
+    <button class="btn" type="submit">เปิดงาน</button>
+    <div class="recent" id="recent"></div>
+    <div id="err"></div>
+    <details id="bmk">
+      <summary>ยังไม่มี bookmark "Ein viewer"? ติดตั้งที่นี่</summary>
+      <p>สร้าง bookmark ใหม่ ตั้งชื่อ <b>Ein viewer</b> แล้ววางข้อความด้านล่างทั้งหมดเป็น URL ของ bookmark (ครั้งแรกที่กดจะถาม URL ของหน้านี้ ซึ่งคือ <code id="selfUrl"></code>)</p>
+      <textarea id="bmkCode" rows="4" readonly></textarea>
+      <button class="btn" type="button" id="bmkCopy">คัดลอก</button>
+    </details>
+  </form>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { TilesRenderer } from '3d-tiles-renderer';
+
+const $ = (s) => document.querySelector(s);
+const status = (t) => { $('#status').textContent = t; };
+const COLORS = { box: 0xffa000, panel: 0x22d3ee, dish: 0xff4081, yagi: 0xb2ff59, dipole: 0xe040fb, omni: 0xff5252, rl: 0x00ff88, default: 0xffeb3b };
+const LAYER_NAMES = { box: 'RRU/TTA/BOB', panel: 'Panels', dish: 'Dishes', yagi: 'Yagis', dipole: 'Dipoles', omni: 'Omni', rl: 'Origin', tiles: 'Model', arrows: 'Arrows', beacon: 'Beacon' };
+
+// ---------------------------------------------------------------- params
+function parseParams() {
+  const h = location.hash.replace(/^#/, '');
+  const p = new URLSearchParams(h);
+  const base = p.get('base'), sas = p.get('sas');
+  if (!base || !sas) return null;
+  return { job: p.get('job') || base.replace(/\/$/, '').split('/').pop(), base: base.endsWith('/') ? base : base + '/', sas };
+}
+function paramsFromLink(link) {
+  const i = link.indexOf('#');
+  if (i >= 0) {
+    const p = new URLSearchParams(link.slice(i + 1));
+    if (p.get('base') && p.get('sas')) return { job: p.get('job') || '', base: p.get('base'), sas: p.get('sas') };
+  }
+  // a raw blob-storage URL with its SAS (any file of the job, e.g. copied from DevTools) works too
+  const m = /^(https:\/\/[^/]+\.blob\.core\.windows\.net\/([^/?]+)\/)[^?]*\?(.*sig=.*)$/.exec(link);
+  if (m) return { job: m[2], base: m[1], sas: m[3] };
+  return null;
+}
+function recent() { try { return JSON.parse(localStorage.getItem('ssmv:recent') || '[]'); } catch (e) { return []; } }
+function remember(P) {
+  try {
+    const r = recent().filter(x => x.job !== P.job);
+    r.unshift({ job: P.job, base: P.base, sas: P.sas, at: Date.now() });
+    localStorage.setItem('ssmv:recent', JSON.stringify(r.slice(0, 6)));
+  } catch (e) { /* ignore */ }
+}
+function sasExpiry(sas) { const m = /(?:^|&)se=([^&]+)/.exec(sas); return m ? new Date(decodeURIComponent(m[1])) : null; }
+
+// ---------------------------------------------------------------- start screen
+function showStart(msg) {
+  $('#start').hidden = false;
+  $('#err').textContent = msg || '';
+  const r = recent();
+  $('#recent').innerHTML = r.map((x, i) => {
+    const exp = sasExpiry(x.sas); const dead = exp && exp < new Date();
+    return `<button class="btn" type="button" data-i="${i}" ${dead ? 'disabled title="ลิงก์หมดอายุแล้ว"' : ''}>${x.job}${dead ? ' (หมดอายุ)' : ''}</button>`;
+  }).join('');
+  $('#recent').querySelectorAll('button').forEach(b => b.addEventListener('click', () => { const x = r[+b.dataset.i]; location.hash = `job=${encodeURIComponent(x.job)}&base=${encodeURIComponent(x.base)}&sas=${encodeURIComponent(x.sas)}`; boot(); }));
+}
+$('#startForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const raw = $('#linkIn').value.trim();
+  const P = paramsFromLink(raw);
+  if (!P) {
+    const m = /app\.sitesee\.com\.au\/site-viewer\/([^/?#]+)/.exec(raw);
+    $('#err').textContent = m
+      ? `นี่คือ URL ของเว็บบริษัท (${m[1]}) — หน้านี้เข้าถึงข้อมูลผ่าน URL นั้นไม่ได้เพราะไม่มี login
+เปิด URL นั้นใน Chrome ที่ login แล้ว รอโมเดลขึ้น แล้วกด bookmark "Ein viewer" (ติดตั้งจากหัวข้อด้านล่าง)`
+      : 'ลิงก์ไม่ถูกต้อง: ต้องเป็นลิงก์จาก bookmarklet (…viewer.html#job=…&base=…&sas=…)';
+    return;
+  }
+  location.hash = `job=${encodeURIComponent(P.job)}&base=${encodeURIComponent(P.base)}&sas=${encodeURIComponent(P.sas)}`;
+  boot();
+});
+$('#btnMenu').addEventListener('click', () => showStart(''));
+(function bookmarklet() {
+  const self = location.href.split('#')[0];
+  $('#selfUrl').textContent = self;
+  const code = "javascript:(function(){try{var E=performance.getEntriesByType('resource').map(function(e){return e.name}).filter(function(u){return /blob\\.core\\.windows\\.net\\/[^/]+\\/.*[?&]sig=/.test(u)});if(!E.length){alert('ยังไม่พบลิงก์ข้อมูลของงาน: รอให้โมเดลโหลดขึ้นก่อน แล้วกดอีกครั้ง');return}var u=new URL(E[0]);var job=u.pathname.split('/')[1];var base=u.origin+'/'+job+'/';var sas=u.search.slice(1);var V=localStorage.getItem('einViewerUrl')||'" + self + "';localStorage.setItem('einViewerUrl',V);var link=V+'#job='+encodeURIComponent(job)+'&base='+encodeURIComponent(base)+'&sas='+encodeURIComponent(sas);var w=window.open(link,'_blank');if(!w){prompt('เปิดแท็บใหม่ไม่ได้ — คัดลอกลิงก์นี้ไปเปิดเอง',link)}}catch(e){alert('bookmarklet error: '+e.message)}})();";
+  $('#bmkCode').value = code;
+  $('#bmkCopy').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(code); $('#bmkCopy').textContent = 'คัดลอกแล้ว'; }
+    catch (e) { $('#bmkCode').select(); $('#bmkCopy').textContent = 'กด Ctrl+C'; }
+  });
+})();
+
+// ---------------------------------------------------------------- three
+const canvas = $('#c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1b2838);
+const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 20000);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true; controls.dampingFactor = 0.12;
+controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
+controls.screenSpacePanning = true;
+controls.maxPolarAngle = Math.PI * 0.95;
+const world = new THREE.Group();           // ECEF -> local: rotated so the site's up is +Y
+scene.add(world);
+scene.add(new THREE.AmbientLight(0xffffff, 1.0));
+const equipGroup = new THREE.Group(); world.add(equipGroup);
+const overlayGroup = new THREE.Group(); world.add(overlayGroup);
+let tiles = null, siteCentre = null, siteUp = null;
+const layerGroups = {};
+const equipment = [];                       // {mesh, name, cls, item}
+const prefs = Object.assign({ arrows: true, arrowsBox: false, beacon: false, beaconHeight: 10, quality: 10 }, (() => { try { return JSON.parse(localStorage.getItem('ssmv:prefs') || '{}'); } catch (e) { return {}; } })());
+const savePrefs = () => { try { localStorage.setItem('ssmv:prefs', JSON.stringify(prefs)); } catch (e) { /* ignore */ } };
+
+function resize() {
+  const w = canvas.clientWidth || window.innerWidth, h = canvas.clientHeight || window.innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+  if (tiles) tiles.setResolutionFromRenderer(camera, renderer);
+}
+window.addEventListener('resize', resize);
+
+function toLocal(ecef) { return new THREE.Vector3(...ecef).applyMatrix4(world.matrixWorld); }
+function setWorldFrame(centreEcef) {
+  siteCentre = new THREE.Vector3(...centreEcef);
+  siteUp = siteCentre.clone().normalize();
+  const q = new THREE.Quaternion().setFromUnitVectors(siteUp, new THREE.Vector3(0, 1, 0));
+  world.quaternion.copy(q);
+  world.position.copy(siteCentre.clone().applyQuaternion(q).negate());
+  world.updateMatrixWorld(true);
+}
+
+// ---------------------------------------------------------------- equipment
+function makeMesh(item) {
+  let geom;
+  if (item.type === 'box') geom = new THREE.BoxGeometry(item.width, item.height, item.depth);
+  else if (item.type === 'cylinder') geom = new THREE.CylinderGeometry(item.radiusTop ?? item.radius, item.radiusBottom ?? item.radius, item.height ?? item.length, 32);
+  else if (item.type === 'sphere') geom = new THREE.SphereGeometry(item.radius || 0.12, 24, 16);
+  else return null;
+  const col = item.material && item.material.color ? new THREE.Color(...item.material.color) : new THREE.Color(0xffffff);
+  const mat = new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: (item.material && item.material.alpha) ?? 0.45, depthWrite: false });
+  const mesh = new THREE.Mesh(geom, mat);
+  const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geom, 20), new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.9 }));
+  edges.raycast = () => {};
+  mesh.add(edges);
+  const t = item.transform || {};
+  if (t.position) mesh.position.set(...t.position);
+  if (t.rotation) mesh.rotation.set(t.rotation[0], t.rotation[1], t.rotation[2]);
+  if (t.scale) mesh.scale.set(...t.scale);
+  return mesh;
+}
+function bearingOf(mesh, dirLocal) {
+  const p = mesh.getWorldPosition(new THREE.Vector3());               // local frame (world group applied)
+  const q = mesh.getWorldQuaternion(new THREE.Quaternion());
+  // in the local frame, up = +Y; north = ECEF +Z projected; east = north x up
+  const ecefZ = new THREE.Vector3(0, 0, 1).applyQuaternion(world.quaternion);
+  const up = new THREE.Vector3(0, 1, 0);
+  const east = ecefZ.clone().cross(up).normalize();
+  const north = up.clone().cross(east).normalize();
+  const f = dirLocal.clone().applyQuaternion(q);
+  return ((Math.atan2(f.dot(east), f.dot(north)) * 180 / Math.PI) + 360) % 360;
+}
+function textSprite(text, color, w, h) {
+  const c = document.createElement('canvas'); c.width = 512; c.height = 128;
+  const g = c.getContext('2d');
+  g.fillStyle = 'rgba(0,0,0,0.6)'; g.fillRect(0, 0, 512, 128);
+  g.font = 'bold 76px system-ui, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillStyle = '#' + color.toString(16).padStart(6, '0'); g.fillText(text, 256, 68);
+  const tex = new THREE.CanvasTexture(c);
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
+  s.scale.set(w, h, 1); s.renderOrder = 1000; s.raycast = () => {};
+  return s;
+}
+function addArrow(mesh, cls, item) {
+  let dir, origin, span;
+  if (item.type === 'cylinder') { dir = new THREE.Vector3(0, 1, 0); origin = new THREE.Vector3(0, (item.height ?? item.length) / 2, 0); span = 2 * (item.radius || 0.2); }
+  else if (item.type === 'box') { dir = new THREE.Vector3(0, 0, -1); origin = new THREE.Vector3(0, 0, -item.depth / 2); span = Math.max(item.width, item.height); }
+  else return;
+  const color = COLORS[cls] || COLORS.default;
+  const len = Math.min(1.2, Math.max(0.25, 0.5 * span));
+  const a = new THREE.ArrowHelper(dir, origin, len, color, 0.35 * len, 0.2 * len);
+  for (const part of [a.line, a.cone]) { part.material.depthTest = false; part.material.transparent = true; part.renderOrder = 999; part.raycast = () => {}; }
+  a.name = 'arrow'; mesh.add(a);
+  const b = bearingOf(mesh, dir);
+  const lw = Math.min(0.8, Math.max(0.25, 0.6 * span));
+  const label = textSprite(Math.round(b) + '°', color, lw, lw / 4);
+  label.name = 'arrow-label'; label.position.copy(origin).addScaledVector(dir, len * 1.15); mesh.add(label);
+  mesh.userData.bearing = b;
+}
+function addBeacon(originMesh) {
+  const old = originMesh.getObjectByName('beacon'); if (old) originMesh.remove(old);
+  const H = prefs.beaconHeight;
+  const g = new THREE.Group(); g.name = 'beacon';
+  const geom = new THREE.CylinderGeometry(0.12, 0.12, H, 12); geom.translate(0, H / 2, 0);
+  const col = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ color: COLORS.rl, depthTest: false, transparent: true, opacity: 0.9 }));
+  col.renderOrder = 998; col.raycast = () => {}; g.add(col);
+  const label = textSprite('ORIGIN', COLORS.rl, 12, 3); label.position.set(0, H + 2, 0); g.add(label);
+  const up = new THREE.Vector3(...originMesh.userData.ecef).normalize();
+  g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), up.applyQuaternion(originMesh.quaternion.clone().invert()));
+  originMesh.add(g);                          // child of the origin sphere: shows with the Origin layer
+}
+
+// ---------------------------------------------------------------- UI helpers
+function chip(key, label, color, on, onToggle) {
+  const el = document.createElement('div'); el.className = 'chip' + (on ? '' : ' off'); el.style.setProperty('--c', color);
+  el.innerHTML = `<i></i><span>${label}</span>`;
+  el.addEventListener('click', () => { const now = el.classList.toggle('off'); onToggle(!now); });
+  $('#layers').appendChild(el);
+  return el;
+}
+function flyTo(targetLocal, distance, polar = 0.9) {
+  const dir = new THREE.Vector3(Math.sin(polar) * 0.7, Math.cos(polar), Math.sin(polar) * 0.7).normalize();
+  controls.target.copy(targetLocal);
+  camera.position.copy(targetLocal).addScaledVector(dir, distance);
+  controls.update();
+}
+function fitObjects(objects, pad = 1.4) {
+  if (!objects.length) return;
+  const box = new THREE.Box3();
+  objects.forEach(o => { o.updateWorldMatrix(true, false); box.expandByObject(o); });
+  if (box.isEmpty()) return;
+  const sphere = box.getBoundingSphere(new THREE.Sphere());
+  const dist = Math.max(2, sphere.radius * pad / Math.tan(camera.fov * Math.PI / 360));
+  flyTo(sphere.center, dist);
+}
+function showInfo(e) {
+  $('#info').hidden = false;
+  const it = e.item; const dims = it.type === 'box' ? `${(it.width * 100).toFixed(0)} × ${(it.depth * 100).toFixed(0)} × ${(it.height * 100).toFixed(0)} ซม. (กว้าง×ลึก×สูง)` : it.type === 'cylinder' ? `Ø ${(2 * it.radius * 100).toFixed(0)} ซม., หนา ${((it.height ?? it.length) * 100).toFixed(0)} ซม.` : '';
+  $('#info').innerHTML = `<span>ชื่อ</span><b>${e.name}</b><span>ชนิด</span><b>${e.cls}</b><span>ขนาด</span><b>${dims}</b><span>bearing</span><b>${e.mesh.userData.bearing != null ? Math.round(e.mesh.userData.bearing) + '°' : '-'}</b><span>รายละเอียด</span><b id="infoMore">กำลังโหลด…</b>`;
+  $('#sheet').classList.remove('min');
+  fetch(P.base + it.data.resource + '?' + P.sas).then(r => r.ok ? r.json() : null).then(j => {
+    if (!j) { $('#infoMore').textContent = '-'; return; }
+    const parts = [];
+    if (j.tilt != null) parts.push(`tilt ${(+j.tilt).toFixed(1)}°`);
+    if (j.roll != null) parts.push(`roll ${(+j.roll).toFixed(1)}°`);
+    if (j.bearing != null) parts.push(`bearing ${(+j.bearing).toFixed(1)}°`);
+    if (j.x != null) parts.push(`site xyz ${(+j.x).toFixed(2)}, ${(+j.y).toFixed(2)}, ${(+j.z).toFixed(2)}`);
+    $('#infoMore').textContent = parts.join(' · ') || JSON.stringify(j).slice(0, 120);
+  }).catch(() => { $('#infoMore').textContent = '-'; });
+}
+
+// ---------------------------------------------------------------- picking
+const ray = new THREE.Raycaster(); const ptr = new THREE.Vector2(); let downAt = null;
+canvas.addEventListener('pointerdown', e => { downAt = [e.clientX, e.clientY, Date.now()]; });
+canvas.addEventListener('pointerup', e => {
+  if (!downAt) return;
+  const moved = Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]);
+  const dt = Date.now() - downAt[2]; downAt = null;
+  if (moved > 8 || dt > 400) return;
+  const r = canvas.getBoundingClientRect();
+  ptr.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  ray.setFromCamera(ptr, camera);
+  const hits = ray.intersectObjects(equipment.filter(x => x.mesh.visible && x.mesh.parent.visible).map(x => x.mesh), false);
+  if (hits.length) { const e2 = equipment.find(x => x.mesh === hits[0].object); if (e2) showInfo(e2); }
+});
+
+// ---------------------------------------------------------------- sheet
+const sheet = $('#sheet');
+const toggleSheet = () => { sheet.classList.toggle('min'); $('#btnSheet').textContent = sheet.classList.contains('min') ? '▲' : '▼'; };
+$('#btnSheet').addEventListener('click', toggleSheet); $('#grip').addEventListener('click', toggleSheet);
+
+// ---------------------------------------------------------------- boot
+let P = null, bootGen = 0;
+async function boot() {
+  const gen = ++bootGen;                      // a second boot (hashchange + submit) must not add chips twice
+  P = parseParams();
+  if (!P) { showStart(''); return; }
+  $('#start').hidden = true;
+  $('#job').textContent = P.job;
+  const exp = sasExpiry(P.sas);
+  if (exp && exp < new Date()) { showStart(`ลิงก์ของ ${P.job} หมดอายุเมื่อ ${exp.toLocaleString()} — กด bookmarklet บน app.sitesee.com.au อีกครั้ง`); return; }
+  remember(P);
+  // reset scene
+  equipment.length = 0; equipGroup.clear(); overlayGroup.clear(); $('#layers').innerHTML = ''; $('#list').innerHTML = ''; $('#info').hidden = true;
+  if (tiles) { world.remove(tiles.group); tiles.dispose(); tiles = null; }
+  status('โหลด scene.json…');
+  let sceneJson;
+  try {
+    const r = await fetch(P.base + 'scene.json?' + P.sas);
+    if (!r.ok) throw new Error(`scene.json → HTTP ${r.status}`);
+    sceneJson = await r.json();
+  } catch (e) { showStart(`โหลดข้อมูลไม่ได้: ${e.message}\n(ลิงก์หมดอายุ? หรือเปิดจาก file:// ที่ถูกบล็อก)`); return; }
+  if (gen !== bootGen) return;
+  equipGroup.clear(); overlayGroup.clear(); $('#layers').innerHTML = '';
+
+  // the site frame: use the camera target (centre of the site) from scene.json, else the origin
+  const cam = sceneJson.cameras && (sceneJson.cameras[(sceneJson.config || {}).defaultCamera] || Object.values(sceneJson.cameras)[0]);
+  const originItem = sceneJson.layers && sceneJson.layers.rl && Object.values(sceneJson.layers.rl.items || {})[0];
+  const centre = (cam && cam.transform && cam.transform.target) || (originItem && originItem.transform.position) || [0, 0, 0];
+  setWorldFrame(centre);
+
+  // equipment layers
+  const layers = sceneJson.layers || {};
+  const order = ['box', 'panel', 'dish', 'yagi', 'dipole', 'omni', 'rl'];
+  let originMesh = null;
+  for (const key of order) {
+    const L = layers[key]; if (!L) continue;
+    const g = new THREE.Group(); g.name = key; g.visible = key !== 'rl'; equipGroup.add(g); layerGroups[key] = g;
+    for (const [id, item] of Object.entries(L.items || {})) {
+      const mesh = makeMesh(item); if (!mesh) continue;
+      mesh.name = id; mesh.userData.item = item; mesh.userData.ecef = item.transform.position;
+      g.add(mesh);
+      if (key === 'rl') { originMesh = mesh; continue; }
+      if (!/_mount$/.test(id) && key !== 'omni') addArrow(mesh, key, item);
+      if (key === 'box') mesh.children.forEach(c => { if (c.name === 'arrow' || c.name === 'arrow-label') c.visible = !!prefs.arrowsBox; });
+      equipment.push({ mesh, name: id, cls: key, item });
+    }
+    chip(key, `${LAYER_NAMES[key] || key} (${g.children.length})`, '#' + (COLORS[key] || COLORS.default).toString(16).padStart(6, '0'), g.visible, on => { g.visible = on; });
+  }
+  if (originMesh) addBeacon(originMesh);
+  const applyArrows = () => equipment.forEach(e => e.mesh.children.forEach(c => { if (c.name === 'arrow' || c.name === 'arrow-label') c.visible = !!prefs.arrows && (e.cls !== 'box' || !!prefs.arrowsBox); }));
+  chip('arrows', 'Arrows', '#ffffff', prefs.arrows, on => { prefs.arrows = on; savePrefs(); applyArrows(); });
+  chip('arrowsBox', 'Box arrows', '#ffa000', prefs.arrowsBox, on => { prefs.arrowsBox = on; savePrefs(); applyArrows(); });
+  applyArrows();
+  $('#count').textContent = `${equipment.length} ชิ้น`;
+  $('#list').innerHTML = equipment.map((e, i) => `<button class="it" data-i="${i}" style="--c:#${(COLORS[e.cls] || COLORS.default).toString(16).padStart(6, '0')}"><i></i>${e.name}</button>`).join('');
+  $('#list').querySelectorAll('.it').forEach(b => b.addEventListener('click', () => { const e = equipment[+b.dataset.i]; fitObjects([e.mesh], 4); showInfo(e); }));
+
+  // tiles
+  const tilesLayer = layers.tiles && Object.values(layers.tiles.items || {})[0];
+  const tilesUrl = P.base + ((tilesLayer && tilesLayer.content_url) || '3dtiles/3dtiles.json');
+  tiles = new TilesRenderer(tilesUrl + '?' + P.sas);
+  // the SAS goes on every blob-storage request; the hook also sees the blob:/data: URLs of
+  // textures embedded in the glTF, and a query string appended to those breaks them
+  tiles.preprocessURL = (u) => { const s = String(u); if (!/^https?:/.test(s) || /sig=/.test(s)) return s; return s + (s.includes('?') ? '&' : '?') + P.sas; };
+  tiles.errorTarget = prefs.quality;
+  tiles.maxDepth = Infinity;
+  tiles.lruCache.minSize = 400; tiles.lruCache.maxSize = 900;
+  tiles.downloadQueue.maxJobs = 6; tiles.parseQueue.maxJobs = 2;
+  tiles.setCamera(camera); tiles.setResolutionFromRenderer(camera, renderer);
+  const unlit = (sc) => sc.traverse(c => { if (c.isMesh && c.material) { const old = c.material; c.material = new THREE.MeshBasicMaterial({ map: old.map || null, color: old.map ? 0xffffff : (old.color || 0xaaaaaa) }); old.dispose && old.dispose(); } });
+  tiles.addEventListener('load-model', (e) => unlit(e.scene));
+  tiles.addEventListener('load-tile-set', () => { status(`โหลดโมเดล… (${P.job})`); world.updateMatrixWorld(true); });
+  world.add(tiles.group);
+  world.updateMatrixWorld(true);              // TilesGroup only recomputes when forced; without this it stays at identity
+  chip('tiles', 'Model', '#9aa6b4', true, on => { tiles.group.visible = on; });
+
+  // camera: official view if present, else frame the equipment
+  if (cam && cam.transform && cam.transform.position && cam.transform.target) {
+    camera.position.copy(toLocal(cam.transform.position));
+    controls.target.copy(toLocal(cam.transform.target));
+    controls.update();
+  } else if (equipment.length) { fitObjects(equipment.map(e => e.mesh)); }
+  resize();
+  status(`${P.job} · ${equipment.length} ชิ้น · ลาก = หมุน, สองนิ้ว = ซูม/เลื่อน`);
+}
+
+$('#btnFit').addEventListener('click', () => { if (tiles) { const s = new THREE.Sphere(); if (tiles.getBoundingSphere(s)) { s.center.applyMatrix4(world.matrixWorld); flyTo(s.center, Math.max(10, s.radius * 1.6 / Math.tan(camera.fov * Math.PI / 360)), 0.7); return; } } fitObjects(equipment.map(e => e.mesh)); });
+$('#btnEquip').addEventListener('click', () => fitObjects(equipment.map(e => e.mesh)));
+$('#btnOrigin').addEventListener('click', () => { const o = layerGroups.rl && layerGroups.rl.children[0]; if (o) { layerGroups.rl.visible = true; [...document.querySelectorAll('#layers .chip')].find(c => c.textContent.startsWith('Origin'))?.classList.remove('off'); fitObjects([o], 12); } });
+$('#btnTop').addEventListener('click', () => { const t = controls.target.clone(); const d = camera.position.distanceTo(t); camera.position.set(t.x, t.y + d, t.z + 0.001); controls.update(); });
+$('#btnIn').addEventListener('click', () => { camera.position.lerp(controls.target, 0.3); controls.update(); });
+$('#btnOut').addEventListener('click', () => { camera.position.sub(controls.target).multiplyScalar(1.4).add(controls.target); controls.update(); });
+
+let lastStats = '';
+function loop() {
+  requestAnimationFrame(loop);
+  controls.update();
+  if (tiles) {
+    camera.updateMatrixWorld();
+    tiles.group.updateMatrixWorld(true);
+    tiles.update();
+    const dl = tiles.stats.downloading + tiles.stats.parsing;
+    const txt = dl ? `โหลด tiles… ${dl} ค้าง · แสดง ${tiles.stats.visible}` : '';
+    if (txt !== lastStats) { lastStats = txt; $('#load').hidden = !txt; $('#load').textContent = txt; }
+  }
+  renderer.render(scene, camera);
+}
+resize(); loop();
+window.addEventListener('hashchange', () => boot());
+boot();
+</script>
+</body>
+</html>
